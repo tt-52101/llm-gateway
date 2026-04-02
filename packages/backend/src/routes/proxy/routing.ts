@@ -122,8 +122,8 @@ export function hasAvailableRoutingTargets(
   excludeTargetKeys?: Set<string>
 ): boolean {
   return config.targets.some(target =>
-    circuitBreaker.isAvailable(getTargetKey(target)) &&
-    (!excludeTargetKeys || !excludeTargetKeys.has(getTargetKey(target)))
+    (!excludeTargetKeys || !excludeTargetKeys.has(getTargetKey(target))) &&
+    circuitBreaker.peekAvailability(getTargetKey(target))
   );
 }
 
@@ -239,8 +239,8 @@ export function selectRoutingTarget(
   }
 
   const availableTargets = config.targets.filter(t =>
-    circuitBreaker.isAvailable(getTargetKey(t)) &&
-    (!excludeTargetKeys || !excludeTargetKeys.has(getTargetKey(t)))
+    (!excludeTargetKeys || !excludeTargetKeys.has(getTargetKey(t))) &&
+    circuitBreaker.isAvailable(getTargetKey(t))
   );
 
   if (availableTargets.length === 0) {
@@ -378,118 +378,119 @@ export async function resolveSmartRouting(
     throw new Error('Smart routing config not found');
   }
 
+  let config: RoutingConfig;
   try {
-    const config = JSON.parse(routingConfig.config);
-
-    const mode: RoutingConfig['strategy']['mode'] = (config.strategy?.mode || routingConfig.type) as any;
-
-    let routingKey: string | undefined;
-    if (mode === 'hash') {
-      const hashSource = config.strategy?.hashSource || 'virtualKey';
-      if (hashSource === 'virtualKey' && virtualKeyId) {
-        routingKey = virtualKeyId;
-      } else if (hashSource === 'request' && request?.body) {
-        // 使用请求体的哈希作为key
-        routingKey = JSON.stringify(request.body);
-      }
-    } else if (mode === 'affinity') {
-      routingKey = extractAffinityScopeKey(request as any, virtualKeyId);
-    }
-
-    // 记录当前路由配置是否存在 targets，用于后续区分配置问题 vs. 熔断/负载问题
-    const hasTargets = Array.isArray(config.targets) && config.targets.length > 0;
-
-    const selectedTarget = selectRoutingTarget(
-      config,
-      routingConfig.type,
-      model.routing_config_id,
-      routingKey,
-      excludeTargetKeys
-    );
-
-    if (!selectedTarget) {
-      if (!hasTargets) {
-        memoryLogger.error(
-          `Smart routing config has no targets: ${model.routing_config_id}`,
-          'Proxy'
-        );
-        throw new Error('Smart routing config has no targets');
-      }
-
-      // 存在 targets 但没有可用目标，说明可能全部被熔断或在本次请求中轮转耗尽
-      const error: any = new Error('当前上游负载忙，请稍后重试');
-      error.statusCode = 503;
-      error.code = 'upstream_overloaded';
-
-      memoryLogger.warn(
-        `Smart routing: all targets unavailable (possibly circuit breaker open) | config: ${model.routing_config_id}`,
-        'Proxy'
-      );
-
-      throw error;
-    }
-
-    const provider = await providerDb.getById(selectedTarget.provider);
-    if (!provider) {
-      memoryLogger.error(`Smart routing target provider not found: ${selectedTarget.provider}`, 'Proxy');
-      throw new Error('Smart routing target provider not found');
-    }
-
-    // 智能路由重试需要按 target key 排除，避免同一 provider 下的其他真实模型被误伤。
-    const updatedExcludeTargetKeys = excludeTargetKeys || new Set<string>();
-    updatedExcludeTargetKeys.add(getTargetKey(selectedTarget));
-
-    const result: ResolveProviderResult = {
-      provider,
-      providerId: selectedTarget.provider,
-      circuitBreakerKey: getTargetKey(selectedTarget),
-      excludeTargetKeys: updatedExcludeTargetKeys,
-      canRetry: hasAvailableRoutingTargets(config, updatedExcludeTargetKeys)
-    };
-
-    // 查找真实模型配置（用于获取 protocol）
-    let resolvedModel: any = null;
-    if (selectedTarget.override_params?.model) {
-      result.modelOverride = selectedTarget.override_params.model;
-
-      // 从 provider 下查找匹配的真实模型
-      const providerModels = await modelDb.getByProviderId(selectedTarget.provider);
-      resolvedModel = providerModels.find(m =>
-        m.is_virtual !== 1 && (
-          m.model_identifier === selectedTarget.override_params!.model ||
-          m.name === selectedTarget.override_params!.model
-        )
-      );
-
-      if (resolvedModel) {
-        result.resolvedModel = resolvedModel;
-        memoryLogger.debug(
-          `Smart routing resolved real model: ${resolvedModel.name} | protocol: ${resolvedModel.protocol || 'auto'}`,
-          'Routing'
-        );
-      } else {
-        memoryLogger.warn(
-          `Smart routing could not find real model for: ${selectedTarget.override_params.model} in provider: ${provider.name}`,
-          'Routing'
-        );
-      }
-
-      memoryLogger.debug(
-        `Smart routing model override: ${selectedTarget.override_params.model}`,
-        'Proxy'
-      );
-    }
-
-    memoryLogger.info(
-      `Smart routing target selected: provider=${provider.name} | model=${selectedTarget.override_params?.model || 'default'} | protocol=${resolvedModel?.protocol || 'auto'}`,
-      'Proxy'
-    );
-
-    return result;
+    config = JSON.parse(routingConfig.config);
   } catch (e: any) {
     memoryLogger.error(`Failed to parse smart routing config: ${e.message}`, 'Proxy');
     throw new Error(`Smart routing config parse error: ${e.message}`);
   }
+
+  const mode: RoutingConfig['strategy']['mode'] = (config.strategy?.mode || routingConfig.type) as any;
+
+  let routingKey: string | undefined;
+  if (mode === 'hash') {
+    const hashSource = config.strategy?.hashSource || 'virtualKey';
+    if (hashSource === 'virtualKey' && virtualKeyId) {
+      routingKey = virtualKeyId;
+    } else if (hashSource === 'request' && request?.body) {
+      // 使用请求体的哈希作为key
+      routingKey = JSON.stringify(request.body);
+    }
+  } else if (mode === 'affinity') {
+    routingKey = extractAffinityScopeKey(request as any, virtualKeyId);
+  }
+
+  // 记录当前路由配置是否存在 targets，用于后续区分配置问题 vs. 熔断/负载问题
+  const hasTargets = Array.isArray(config.targets) && config.targets.length > 0;
+
+  const selectedTarget = selectRoutingTarget(
+    config,
+    routingConfig.type,
+    model.routing_config_id,
+    routingKey,
+    excludeTargetKeys
+  );
+
+  if (!selectedTarget) {
+    if (!hasTargets) {
+      memoryLogger.error(
+        `Smart routing config has no targets: ${model.routing_config_id}`,
+        'Proxy'
+      );
+      throw new Error('Smart routing config has no targets');
+    }
+
+    // 存在 targets 但没有可用目标，说明可能全部被熔断或在本次请求中轮转耗尽
+    const error: any = new Error('当前上游负载忙，请稍后重试');
+    error.statusCode = 503;
+    error.code = 'upstream_overloaded';
+
+    memoryLogger.warn(
+      `Smart routing: all targets unavailable (possibly circuit breaker open) | config: ${model.routing_config_id}`,
+      'Proxy'
+    );
+
+    throw error;
+  }
+
+  const provider = await providerDb.getById(selectedTarget.provider);
+  if (!provider) {
+    memoryLogger.error(`Smart routing target provider not found: ${selectedTarget.provider}`, 'Proxy');
+    throw new Error('Smart routing target provider not found');
+  }
+
+  // 智能路由重试需要按 target key 排除，避免同一 provider 下的其他真实模型被误伤。
+  const updatedExcludeTargetKeys = excludeTargetKeys || new Set<string>();
+  updatedExcludeTargetKeys.add(getTargetKey(selectedTarget));
+
+  const result: ResolveProviderResult = {
+    provider,
+    providerId: selectedTarget.provider,
+    circuitBreakerKey: getTargetKey(selectedTarget),
+    excludeTargetKeys: updatedExcludeTargetKeys,
+    canRetry: hasAvailableRoutingTargets(config, updatedExcludeTargetKeys)
+  };
+
+  // 查找真实模型配置（用于获取 protocol）
+  let resolvedModel: any = null;
+  if (selectedTarget.override_params?.model) {
+    result.modelOverride = selectedTarget.override_params.model;
+
+    // 从 provider 下查找匹配的真实模型
+    const providerModels = await modelDb.getByProviderId(selectedTarget.provider);
+    resolvedModel = providerModels.find(m =>
+      m.is_virtual !== 1 && (
+        m.model_identifier === selectedTarget.override_params!.model ||
+        m.name === selectedTarget.override_params!.model
+      )
+    );
+
+    if (resolvedModel) {
+      result.resolvedModel = resolvedModel;
+      memoryLogger.debug(
+        `Smart routing resolved real model: ${resolvedModel.name} | protocol: ${resolvedModel.protocol || 'auto'}`,
+        'Routing'
+      );
+    } else {
+      memoryLogger.warn(
+        `Smart routing could not find real model for: ${selectedTarget.override_params.model} in provider: ${provider.name}`,
+        'Routing'
+      );
+    }
+
+    memoryLogger.debug(
+      `Smart routing model override: ${selectedTarget.override_params.model}`,
+      'Proxy'
+    );
+  }
+
+  memoryLogger.info(
+    `Smart routing target selected: provider=${provider.name} | model=${selectedTarget.override_params?.model || 'default'} | protocol=${resolvedModel?.protocol || 'auto'}`,
+    'Proxy'
+  );
+
+  return result;
 }
 
 export async function resolveExpertRouting(
